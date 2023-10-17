@@ -330,6 +330,252 @@ Mounts for `django-demo` application container:
 
 <img src="https://github.com/digitalake/do-terraform-k8s-helm/assets/109740456/7e0d260e-b741-48f3-9136-3a7ef8f39ed2" width="800">
 
+
+### Implementing Pod Security
+
+Pod Security Admission labels for namespaces
+Once the feature is enabled or the webhook is installed, you can configure namespaces to define the admission control mode you want to use for pod security in each namespace. Kubernetes defines a set of labels that you can set to define which of the predefined Pod Security Standard levels you want to use for a namespace. The label you select defines what action the control plane takes if a potential violation is detected:
+
+- `enforce`	Policy violations will cause the pod to be rejected.
+- `audit`	Policy violations will trigger the addition of an audit annotation to the event recorded in the audit log, but are otherwise allowed.
+- `warn`	Policy violations will trigger a user-facing warning, but are otherwise allowed.
+
+The Pod Security Standards define three different policies to broadly cover the security spectrum. These policies are cumulative and range from highly-permissive to highly-restrictive. This guide outlines the requirements of each policy.
+
+Profile	Descriptions:
+
+- `Privileged`	Unrestricted policy, providing the widest possible level of permissions. This policy allows for known privilege escalations.
+- `Baseline`	Minimally restrictive policy which prevents known privilege escalations. Allows the default (minimally specified) Pod configuration.
+- `Restricted`	Heavily restricted policy, following current Pod hardening best practices.
+
+For this task i added `Pod Security Admission` with `enforce` label to enforce pods of the namespace to contain necessary configurations with `Pod Security Standarts Profile` with heavily restricted policy:
+
+Template snippet:
+```
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "django-demo.namespace" . }}
+  labels:
+    {{- toYaml .Values.namespaceLabels | nindent 4 }}
+```
+
+Values snippet:
+```
+namespaceName: application
+...
+namespaceLabels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.28
+```
+
+So pods in my `application` namespace will be validated and rejected if don't contain necessary configuration.
+
+Required options for `Restricted` policy are all the options form `Baseline` policy plus these defined in [Kubernetes docs](https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted):
+
+- Allowed `Volume` types:
+
+  - spec.volumes[*].configMap
+  - spec.volumes[*].csi
+  - spec.volumes[*].downwardAPI
+  - spec.volumes[*].emptyDir
+  - spec.volumes[*].ephemeral
+  - spec.volumes[*].persistentVolumeClaim
+  - spec.volumes[*].projected
+  - spec.volumes[*].secret
+
+- `previlageEscalation` set to "false"
+- `runAsNonRoot` set to "true"
+- `Running as Non-root user` specified
+- `Seccomp` allowed values:
+  - RuntimeDefault
+  - Localhost
+- `Capabilities` Any list of capabilities that includes ALL
+
+For this reason I made some changes to my `Dockerfile` to run as non-root user:
+```
+...
+# Added user creation step
+RUN addgroup -S appgroup && adduser -S -u 1001 -G appgroup appuser
+...
+# Changed owner for the application dir
+COPY --chown=appuser:appgroup . /app
+...
+# Running as non-root
+USER appuser
+...
+```
+
+And pushed new image `django-demo:1.1-non-root` to my DockerHub.
+
+Also I changed the configuration for my `Deployment` to cantain necessary options for all Containers (initContainers too).
+
+Deployment Helm template snippet:
+
+```
+...
+spec:
+...
+  template:
+  ...
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        - name: migrations
+          ...
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ...
+        - name: collectstatic
+          ...
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ...
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+            ...
+```
+
+Values snippet:
+```
+...
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 101
+  fsGroup: 101
+  seccompProfile:
+    type: "RuntimeDefault"
+
+securityContext:
+  privileged: false
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+...
+```
+
+So now it's unable to deploy `Pod` resource in specified namespace without required configuration by `Restricted` policy.
+
+Checking the user inside the application pod:
+
+![image](https://github.com/digitalake/do-terraform-k8s-helm/assets/109740456/710657df-255a-4e8b-9c2f-8a1fdb241206)
+
+
+
+### RBAC implementation
+
+For this case i cretaed `ServiceAccount`, `Role` and `RoleBinding` resources as an example:
+
+`ServiceAccount` template snippet:
+
+```
+{{- if .Values.serviceAccount.create -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "django-demo.serviceAccountName" . }}
+  namespace: {{ include "django-demo.namespace" . }}
+  labels:
+    {{- include "django-demo.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+{{- end }}
+```
+
+`Role` template snippet:
+
+```
+{{- if .Values.serviceAccount.create -}}
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "django-demo.serviceAccountName" . }}
+  namespace: {{ include "django-demo.namespace" . }}
+  labels:
+    {{- include "django-demo.labels" . | nindent 4 }}
+  {{- with .Values.rbac.rules }}
+rules:
+  {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}
+```
+
+`RoleBinding` template snippet:
+
+```
+{{- if .Values.serviceAccount.create -}}
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "django-demo.serviceAccountName" . }}
+  namespace: {{ include "django-demo.namespace" . }}
+  labels:
+    {{- include "django-demo.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "django-demo.serviceAccountName" . }}
+  namespace: {{ include "django-demo.namespace" . }}
+roleRef:
+  kind: Role
+  name: {{ include "django-demo.serviceAccountName" . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}
+```
+
+Values file snippet:
+```
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Automatically mount a ServiceAccount's API credentials?
+  automount: false
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+rbac:
+  # Specifies whether a rbac role should be created
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["get", "watch", "list"]
+```
+
+My Application doesn't require any special roles so I just specified some as an example.
+
+Pod uses specified Service account:
+
+<img src="https://github.com/digitalake/do-terraform-k8s-helm/assets/109740456/7ee33095-4c2f-42fa-b498-209c5f40113b" width="700">
+
+Role details:
+
+<img src="https://github.com/digitalake/do-terraform-k8s-helm/assets/109740456/16ac2476-9eca-45ff-8b4e-691b8a6c9c2e" width="500">
+
+
+
+
+
+
+
+
+
+
+
+
  
 
 
